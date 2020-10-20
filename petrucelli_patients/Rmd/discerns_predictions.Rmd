@@ -1,0 +1,951 @@
+---
+title: "Petrucelli dataset discerns predictions"
+author: "Katharina Hembach"
+date: "1/15/2020"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(exondiscovery)
+  library(here)
+  library(GenomicRanges)
+  library(GenomicFeatures)
+  library(rtracklayer)
+  library(ggplot2)
+  library(ggforce)
+  library(GenomicAlignments)
+  library(dplyr)
+  library(data.table)
+  library(ggrepel)
+  library(viridis)
+  library(stringr)
+})
+```
+
+## Set up
+
+```{r set-up}
+## Make sure that here finds the correct root directory
+# set_here("../")
+gtf <- here("reference/Homo_sapiens.GRCh38.98.gtf")
+outdir <- here("output")
+metadata <- read.csv(here("metadata.txt"))
+
+resdir <- here("discerns_analysis")
+```
+
+
+## Data set
+
+We re-analysed the frontal cortex samples from the Petrucelli dataset. It is a paired-and RNAseq dataset consisting of samples from C9ORF72 (c9ALS) and sporadic ALS (sALS) patients and healthy controls and they sequenced the cerebellum and the frontal cortex of each individual. For this paper, we only used the frontal cortex samples from sALS patients and controls because that is the brain region where TDP-43 pathology occurs in sALS and where we expected to find splicing errors due to loss of nuclear TDP-43.
+The paper can be found (here)[https://www.nature.com/articles/nn.4065].
+We hope to find cryptic exons in the sALS samples that do not appear in the control samples.
+
+The libraries were processed with the `TruSeq Stranded Total Sample Preparation kit (Illumina)` (as stated in the paper).
+
+
+## Prepare annotation
+
+We prepare the genome annotation:
+```{r anno, cache = TRUE}
+anno <- prepare_annotation(gtf)
+names(anno)
+```
+
+# Discerns novel exon predictions
+
+We predict novel exons based on the BAM file and the SJ.out.tab files.
+The strandedness is "reverse" because the libraries were prepared with the Illumina TruSeq protocol. 
+
+We process the files consecutively and save the predictions of each sample as a rds object. 
+
+
+```{r discerns-predictions, message = FALSE}
+## We set message = FALSE so the messages go to stderr and are printed in the console
+runtime <- data.frame(sample = metadata$names, time = NA)
+preds <- vector("list", length = length(metadata$names))
+names(preds) <- metadata$names
+
+for (s in metadata$names) {
+  message(s)
+  sj <- file.path(outdir, "STAR", s, paste0(s, "_pass2_SJ.out.tab"))
+  bam <- file.path(outdir, "STAR", s, paste0(s, "_pass2_Aligned.sortedByCoord.out.bam"))
+  
+  if(!file.exists(here(paste0("Rmd/rds/", s, ".rds")))){
+    start_time <- Sys.time()
+    novel <- find_novel_exons(sj_filename = sj, annotation = anno, 
+                              min_unique = 5, bam = bam, overhang_min = 6, 
+                              lib_type = "PE", stranded = "reverse", 
+                              yield_size = 10000000, read_length = 100, 
+                              cores = 20, tile_width = 1e8)
+    runtime[runtime$sample == s, "time"] <- Sys.time() - start_time
+    saveRDS(novel, here(paste0("Rmd/rds/", s, ".rds")))
+    saveRDS(runtime, here(paste0("Rmd/rds/discerns_runtimes.rds")))
+  } else {
+    novel <- readRDS(here(paste0("Rmd/rds/", s, ".rds")))
+    runtime <- readRDS(here(paste0("Rmd/rds/discerns_runtimes.rds")))
+  }
+  message(nrow(novel))
+  message(runtime[s, "time"])
+  preds[[s]] <- novel
+}
+```
+
+
+```{r}
+runtime <- readRDS(here(paste0("Rmd/rds/discerns_runtimes.rds")))
+runtime
+sapply(preds, nrow)
+```
+
+plot the runtime, the number of predicted novel exons and the number of reads
+is there a correlation between the number of predcitions, the group or the number of reads?
+
+```{r count-reads-BAM}
+## count the  number of reads in each BAM file and divide by 2 go get the number of read pairs
+if (!file.exists(here(paste0("Rmd/rds/nr_reads_per_sample.rds")))) {
+  reads <- data.frame(sample = metadata$names, nr_reads = NA)
+  for (s in metadata$names) {
+    bam <- file.path(outdir, "STAR", s, paste0(s, "_pass2_Aligned.sortedByCoord.out.bam"))
+    tmp <- fread(cmd = paste0("samtools view -c -F 4  ", bam))
+    reads[reads$sample == s, "nr_reads"] <- as.integer(tmp) / 2
+    print(reads)
+  }
+  saveRDS(reads, here(paste0("Rmd/rds/nr_reads_per_sample.rds")))
+} else {
+  reads <- readRDS(here(paste0("Rmd/rds/nr_reads_per_sample.rds")))
+}
+```
+
+
+```{r}
+df <- data.frame(sample = factor(metadata$names, levels = metadata$names), 
+                 group = metadata$group, 
+                 runtime = runtime$time[match(metadata$names, runtime$sample)],
+                 nr_reads = reads$nr_reads[match(metadata$names, reads$sample)],
+                 nr_preds = sapply(preds, nrow), 
+                 sample_nr = metadata$sample_nr)
+
+p <- ggplot(df, aes(x = sample, y = runtime, fill = group)) + 
+  geom_col() + 
+  theme_bw(base_size = 16)  +
+  ylab("runtime (minutes)") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p
+ggsave(file.path(resdir, "discerns_runtime.pdf"), plot = p)
+
+p <- ggplot(df, aes(x = nr_reads, y = runtime, color = group, label = sample_nr)) + 
+  geom_point(size = 3) + 
+  theme_bw(base_size = 16)  +
+  ylab("runtime (minutes)") + xlab("number of aligned reads") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), aspect.ratio = 1) +
+  geom_text_repel()
+p
+ggsave(file.path(resdir, "discerns_nr_reads_runtime.pdf"), plot = p, 
+       width = 7, height = 6)
+
+
+p <- ggplot(df, aes(x = nr_reads, y = nr_preds, color = group, label = sample_nr)) + 
+  geom_point(size = 4, alpha  = 0.9) + 
+  theme_bw(base_size = 20)  +
+  ylab("novel exons (discerns)") + xlab("aligned reads") +
+  theme(aspect.ratio = 1) +
+  # axis.text.x = element_text(angle = 45, hjust = 1)
+  geom_text_repel(point.padding = 0.1) + 
+  scale_color_manual(values = c("black", "#CE4259"))
+p
+ggsave(file.path(resdir, "discerns_nr_reads_nr_preds.pdf"), plot = p, 
+       width = 7, height = 6)
+```
+
+We convert the predicted exons to BED files so we can have a look at them in IGV.
+Each prediction gets annotated with the type: cassette exon, 3' or 5' terminal exon.
+
+```{r, eval = FALSE}
+for (s in metadata$names) {
+  novel <- preds[[s]]
+  novel$name <- "cassette"
+  novel$name[is.na(novel$lend)] <- "5'_terminal"
+  novel$name[is.na(novel$rstart)] <- "3'_terminal"
+  export(GRanges(novel), file.path(resdir, "BED", paste0(s, "_discern_predictions.bed")), format = "BED")
+}
+```
+
+
+# Novel exon comparison between sALS and control samples
+
+X What is the distribution of the number of supporting reads?
+Are there any predictions that are specific for sALS or control? i.e. they appear in 50% of the samples per group but not the other?
+How many predictions are common between samples? How many predictions appear in 2, 3, 4, ... n samples?
+X How many terminal and cassette exon predictions do we have (per group)?
+
+
+### Stats of the novel exon predictions
+What is the distribution of the minimal number of supporting reads of each predictions?
+How many terminal and cassette exons did we predict?
+
+```{r}
+
+dat <- data.frame(sample = NA, group = NA, min_reads = NA, type = NA, exon_length = NA)
+
+for (s in metadata$names) {
+  novel <- preds[[s]]
+  dat <- rbind(dat, data.frame(sample = s, group = metadata$group[metadata$names == s],
+                               min_reads = novel$min_reads, 
+                               type = ifelse(is.na(novel$lend) | 
+                                               is.na(novel$rstart),
+                                             "terminal", "cassette_exon"),
+                               exon_length = novel$end - novel$start + 1))
+}
+dat <- na.omit(dat)
+dat$sample <- factor(dat$sample, levels = metadata$names)
+## we have one prediction with negative length
+dat <- dat[-which(dat$exon_length == 0),]
+
+
+## How many terminal and cassette exons?
+table(dat$type)
+
+p <- ggplot(dat, aes(sample, y = min_reads))  +
+    geom_sina(aes(color = group)) + 
+  stat_summary(fun.ymin = function(z) { quantile(z,0.25) },
+               fun.ymax = function(z) { quantile(z,0.75) },
+               fun.y = median, size = 0.8, alpha = 0.8) +
+  theme_bw(base_size = 12) + 
+  scale_y_log10() + 
+  scale_color_brewer(palette = "Set2") + 
+  facet_wrap(vars(type)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+p
+
+ggsave(file.path(resdir, "min_reads_per_prediction.png"), p, 
+       dpi = 300, width = 10, height = 5)
+```
+
+<!-- chr6:35468597-35468599 -->
+
+
+What is the length distribution of the predicted exons?
+```{r}
+summary(dat$exon_length)
+
+p <- ggplot(dat, aes(sample, y = exon_length))  +
+  geom_sina(aes(color = group)) + 
+  stat_summary(fun.ymin = function(z) { quantile(z,0.25) },
+               fun.ymax = function(z) { quantile(z,0.75) },
+               fun.y = median, size = 0.8, alpha = 0.8) +
+  theme_bw(base_size = 16) + 
+  scale_y_log10() + 
+  scale_color_brewer(palette = "Set2") + 
+  facet_wrap(vars(type)) + 
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, hjust = 1)) 
+p
+
+ggsave(file.path(resdir, "exon_length_per_prediction.png"), p, 
+       dpi = 300, width = 10, height = 5)
+```
+
+How many microexons were predicted (<=27nts)
+```{r}
+table(dat$exon_length <= 27)
+dat$microexon <- ifelse(dat$exon_length <= 27, "microexon",  ">27nts")
+
+## per sample
+me <- as.data.frame(t(sapply(split(dat, dat$sample), function(x) table(x$microexon))))
+colnames(me) <- c("exon", "microexon")
+me$sample <- rownames(me)
+
+df <- df %>% left_join(me, by = "sample")
+
+
+p <- ggplot(df, aes(x = exon, y = microexon, label = sample_nr, color = group)) +
+  geom_point(size = 3)+ 
+  geom_text_repel() +
+  theme_bw(base_size = 16) 
+p
+
+ggsave(file.path(resdir, "nr_me_exon_per_sample.pdf"), p)
+```
+From the plot, it seems that some of the sALS sample have a slightly higher number of microexons than the control samples with comparable number of exon predictions.
+
+
+
+What is the distribtion of supporting reads among the microexons?
+Sina plot with median and 25% and 75% quantiles.
+```{r}
+dat$microexon <- ifelse(dat$exon_length <= 27, "microexon",  ">27nts")
+
+p <- ggplot(dat, aes(sample, y = min_reads))  +
+  geom_sina(aes(color = group)) + 
+  stat_summary(fun.ymin = function(z) { quantile(z,0.25) },
+               fun.ymax = function(z) { quantile(z,0.75) },
+               fun.y = median, size = 0.8, alpha = 0.8) +
+  theme_bw(base_size = 16) + 
+  scale_y_log10() + 
+  theme(legend.position = "none",  
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_brewer(palette = "Set2") + 
+  facet_grid(vars(microexon), vars(type))
+p
+ggsave(file.path(resdir, "min_reads_per_prediction_me.png"), p, 
+       dpi = 300, width = 10, height = 5)
+```
+
+## Evaluation of the predicted exons
+
+How many novel exons start/end in the same location. Maybe they should be merged?
+```{r}
+## Number of predicted exons with unique start or end  positions
+for (s in metadata$names) {
+  print(s)
+  novel <- preds[[s]]
+  print(nrow(novel))
+  print(length(unique(novel$start)))
+  print(length(unique(novel$end)))
+  ## Distribution of number of novel exons per start position
+  print(table(as.vector(table(novel$start))))
+  print(table(as.vector(table(novel$end))))
+}
+```
+
+To compare the number of common prediction between samples, we compare all four coordinates.
+
+For each prediction, we check with how many other predictions it is identical.
+We create a matrix with the number of identical/overlapping (the genomic ranges overlap) predictions between pairs of samples.
+We also keep a unique list of predictions and the sample names in which the exon was predicted.
+
+The table consists of the prediction coordinates (all 4) and one column per sample. Each sample that contains the exact same prediction will be set to TRUE, else FALSE.
+
+### Number of identical predictions between samples
+```{r}
+## We go through the samples one after another
+## we add a new column to the predictions with the name of the sample and TRUE 
+## we full join the two table, so if the pred is already in the table only the new column gets added
+## if the pred does not exist, it gets added with TRUE in only the sample, but NA in all others.
+
+pred_comp <- preds[[1]]
+pred_comp <- pred_comp[, -c(7, 8, 9, 10)] ## remove sample specific data
+pred_comp[, names(preds)[1]] <- TRUE
+
+for (s in names(preds)[-1]) {
+  novel <- preds[[s]][, -c(7, 8, 9, 10)]
+  novel[, s] <- TRUE
+  
+  pred_comp <- novel %>% full_join(pred_comp, by = c("seqnames", "lend", "start", "end", "rstart", "strand"), )
+}
+## replace all NA with FALSE
+pred_comp[,c(7:ncol(pred_comp))][is.na(pred_comp[,c(7:ncol(pred_comp))])] <- FALSE
+head(pred_comp)
+dim(pred_comp)
+
+m <- pred_comp[,c(7:ncol(pred_comp))]
+
+## For plotting, we compute the pairwise overlap between two sample columns
+mat <- matrix(data = NA, nrow = nrow(metadata), ncol = nrow(metadata), 
+              dimnames = list(metadata$names, metadata$names))
+
+## solution from https://stackoverflow.com/questions/19933788/r-compare-all-the-columns-pairwise-in-matrix
+#  Vector source for column combinations
+n <- seq_len(ncol(m))
+#  Make combinations
+id <- expand.grid(n , n)
+#  Get result
+res_mat <- matrix(colSums(m[ ,id[,1]] & m[ ,id[,2]]), ncol = length(n))
+diag(res_mat) <- NA
+rownames(res_mat) <- colnames(m)
+colnames(res_mat) <- colnames(m)
+
+## we need to convert the data to long format
+res_mat_long <- res_mat %>% as.data.frame %>%
+  tibble::rownames_to_column("sample1") %>%
+  tidyr::gather(sample2, nr_identical, -sample1, factor_key=TRUE)
+
+## heatmap with ggplot
+p <- ggplot(res_mat_long, aes(x = factor(sample1, levels = metadata$names), 
+                              factor(sample2, levels = metadata$names), 
+                              fill = nr_identical)) + 
+  geom_tile() + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                     color = metadata$group),
+        axis.text.y = element_text(color = metadata$group)) +
+  xlab("sample") + ylab("sample")
+p
+ggsave(file.path(resdir, "heatmap_ggplot_nr_identical_predictions.pdf"), p)
+
+
+## normalize by the number of predictions in the smaller of the two samples
+## nr_identical / min(nr_preds1, nr_preds2)
+res_mat <- matrix(colSums(m[ ,id[,1]] & m[ ,id[,2]]), ncol = length(n))
+rownames(res_mat) <- colnames(m)
+colnames(res_mat) <- colnames(m)
+## divide the count matrix by the normalization matrix with the min of both pairs in each cell
+sum_mat <- matrix(pmin(colSums(m[ ,id[,1]]), colSums(m[ ,id[,2]])), ncol = length(n))
+norm_mat <- res_mat/sum_mat
+diag(norm_mat) <- NA
+
+norm_mat_long <- norm_mat %>% as.data.frame %>%
+  tibble::rownames_to_column("sample1") %>%
+  tidyr::gather(sample2, perc_identical, -sample1, factor_key=TRUE)
+
+p <- ggplot(norm_mat_long, aes(x = factor(sample1, levels = metadata$names), 
+                              factor(sample2, levels = metadata$names), 
+                              fill = perc_identical)) + 
+  geom_tile() + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                     color = metadata$group),
+        axis.text.y = element_text(color = metadata$group)) +
+  xlab("sample") + ylab("sample") + 
+  scale_fill_viridis(discrete=FALSE)
+p
+ggsave(file.path(resdir, "heatmap_ggplot_perc_identical_predictions.pdf"), p)
+
+
+## using heatmap
+# pdf(file.path(resdir, "heatmap_nr_identical_predictions.pdf"))
+# heatmap(res_mat, Colv = NA, Rowv = NA, scale = "none")
+# dev.off()
+```
+
+The sALS samples are more similar to each other than the control samples in terms of predicted novel exons. 
+Both types of samples have comparable numbers of novel exons, however, it seems that the sALS samples share more predictions between each other.
+And maybe the common novel exons in the sALS samples can be exlained by the shared TDP-43 pathology (i.e. novel splicing events that can be explained by nuclear clearance of TDP).
+
+
+### Number of identical start or ends coordinates between samples
+How do the numbers change if we only require that the start and end coordinates, but not the connected exons are identical between samples?
+```{r identical-start-end, warnings = FALSE}
+pred_comp <- preds[[1]]
+pred_comp <- pred_comp[, -c(2, 5, 7, 8, 9, 10)] ## remove sample specific data
+pred_comp <- unique(pred_comp)
+pred_comp[, names(preds)[1]] <- TRUE
+
+for (s in names(preds)[-1]) {
+  novel <- preds[[s]][, -c(2, 5, 7, 8, 9, 10)]
+  novel <- unique(novel)
+  novel[, s] <- TRUE
+  pred_comp <- novel %>% full_join(pred_comp, by = c("seqnames", "start", "end", "strand"), )
+}
+## replace all NA with FALSE
+pred_comp[,c(5:ncol(pred_comp))][is.na(pred_comp[,c(5:ncol(pred_comp))])] <- FALSE
+head(pred_comp)
+dim(pred_comp)
+
+m <- pred_comp[,c(5:ncol(pred_comp))]
+n <- seq_len(ncol(m))
+id <- expand.grid(n , n)
+
+res_mat <- matrix(colSums(m[ ,id[,1]] & m[ ,id[,2]]), ncol = length(n))
+rownames(res_mat) <- colnames(m)
+colnames(res_mat) <- colnames(m)
+## divide the count matrix by the normalization matrix with the min of both pairs in each cell
+sum_mat <- matrix(pmin(colSums(m[ ,id[,1]]), colSums(m[ ,id[,2]])), ncol = length(n))
+norm_mat <- res_mat/sum_mat
+diag(norm_mat) <- NA
+
+norm_mat_long <- norm_mat %>% as.data.frame %>%
+  tibble::rownames_to_column("sample1") %>%
+  tidyr::gather(sample2, perc_identical, -sample1, factor_key=TRUE)
+
+p <- ggplot(norm_mat_long, aes(x = factor(sample1, levels = metadata$names), 
+                              factor(sample2, levels = metadata$names), 
+                              fill = perc_identical)) + 
+  geom_tile() + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                     color = metadata$group),
+        axis.text.y = element_text(color = metadata$group)) +
+  xlab("sample") + ylab("sample") + 
+  scale_fill_viridis(discrete=FALSE)
+p
+ggsave(file.path(resdir, "heatmap_ggplot_perc_same_start_end_predictions.pdf"), p)
+```
+The heatmap looks nearly identical to the one based on all four coordinates.
+
+
+
+### Number of identical start or end (cassette) and only start (terminal) coordinates between samples
+We require that the four coordinates have to be identical for cassette exons, but only the SJ and the exon start for terminal exons.
+
+```{r identical-cassette-terminal-specific, warnings = FALSE}
+pred_comp <- preds[[1]]
+pred_comp <- pred_comp[, -c(7, 8, 10)] ## remove sample specific data
+pred_comp <- unique(pred_comp)
+## label the type of prediction
+pred_comp$type <- "cassette"
+pred_comp$type[is.na(pred_comp$lend)] <- "5'_terminal"
+pred_comp$type[is.na(pred_comp$rstart)] <- "3'_terminal"
+pred_comp$min_sup_reads <- pred_comp$min_reads
+pred_comp$max_sup_reads <- pred_comp$min_reads
+
+pred_comp$min_reads <- NULL
+pred_comp[, names(preds)[1]] <- TRUE
+
+## for cassette exons: compare all 4 coordinates
+## for terminal exons: onle the SJ (exons start)
+## keep track of min and max. # supporting reads
+for (s in names(preds)[-1]) {
+  novel <- preds[[s]][, -c(7, 8, 10)]
+  ## lable and split cassette and terminal exons
+  novel$type <- "cassette"
+  novel$type[is.na(novel$lend)] <- "5'_terminal"
+  novel$type[is.na(novel$rstart)] <- "3'_terminal"
+  novel[, s] <- TRUE
+
+  tmp1 <- split(pred_comp, pred_comp$type)
+  tmp2 <- split(novel, novel$type)
+  
+  if("cassette" %in% names(tmp2)){
+    tmp <- tmp2[["cassette"]] %>%
+      full_join(tmp1[["cassette"]], by = c("seqnames", "lend", "start", "end", 
+                                           "rstart", "strand", "type"), 
+                suffix = c("_1", "_2"))
+    tmp$min_sup_reads <- pmin(tmp$min_sup_reads, tmp$min_reads, na.rm = TRUE)
+    tmp$max_sup_reads <- pmax(tmp$max_sup_reads, tmp$min_reads, na.rm = TRUE)
+    tmp$min_reads <- NULL
+    
+  }
+  pred_comp <- tmp
+  
+  if("5'_terminal" %in% names(tmp2)){
+    tmp <- tmp2[["5'_terminal"]] %>%
+      full_join(tmp1[["5'_terminal"]], by = c("seqnames", "end", "rstart", 
+                                              "strand", "type"))
+                # suffix = c("_1", "_2"))
+    ## fix the lend and start coordinates (take the longer novel exon)
+    tmp$min_sup_reads <- pmin(tmp$min_sup_reads, tmp$min_reads, na.rm = TRUE)
+    tmp$max_sup_reads <- pmax(tmp$max_sup_reads, tmp$min_reads, na.rm = TRUE)
+    tmp$lend <- pmin(tmp$lend.x, tmp$lend.y, na.rm = TRUE)
+    tmp$start <- pmin(tmp$start.x, tmp$start.y, na.rm = TRUE)
+    tmp[,c("lend.x", "lend.y", "start.x", "start.y", "min_reads")] <- NULL
+  }
+  pred_comp <- rbind(pred_comp, tmp)
+  
+  if("3'_terminal" %in% names(tmp2)){
+    tmp <- tmp2[["3'_terminal"]] %>%
+      full_join(tmp1[["3'_terminal"]], by = c("seqnames", "lend", "start", 
+                                              "strand", "type"))
+                # suffix = c("_1", "_2"))
+    ## fix the lend and start coordinates (take the longer novel exon)
+    tmp$min_sup_reads <- pmin(tmp$min_sup_reads, tmp$min_reads, na.rm = TRUE)
+    tmp$max_sup_reads <- pmax(tmp$max_sup_reads, tmp$min_reads, na.rm = TRUE)
+    tmp$end <- pmax(tmp$end.x, tmp$end.y, na.rm = TRUE)
+    tmp$rstart <- pmin(tmp$rstart.x, tmp$rstart.y, na.rm = TRUE)
+    tmp[,c("end.x", "end.y", "rstart.x", "rstart.y", "min_reads")] <- NULL
+  }
+  pred_comp <- rbind(pred_comp, tmp)
+}
+
+
+## replace all NA with FALSE
+repl_na <- function(x) {
+  x[is.na(x)] <- FALSE
+  x
+}
+pred_comp <- pred_comp %>% mutate_at(vars(ends_with("_FCX")), repl_na)
+head(pred_comp)
+dim(pred_comp)
+
+m <- pred_comp %>% dplyr::select(ends_with("_FCX"))
+n <- seq_len(ncol(m))
+id <- expand.grid(n , n)
+
+res_mat <- matrix(colSums(m[ ,id[,1]] & m[ ,id[,2]]), ncol = length(n))
+rownames(res_mat) <- colnames(m)
+colnames(res_mat) <- colnames(m)
+## divide the count matrix by the normalization matrix with the min of both pairs in each cell
+sum_mat <- matrix(pmin(colSums(m[ ,id[,1]]), colSums(m[ ,id[,2]])), ncol = length(n))
+norm_mat <- res_mat/sum_mat
+diag(norm_mat) <- NA
+
+norm_mat_long <- norm_mat %>% as.data.frame %>%
+  tibble::rownames_to_column("sample1") %>%
+  tidyr::gather(sample2, perc_identical, -sample1, factor_key=TRUE)
+
+p <- ggplot(norm_mat_long, aes(x = factor(sample1, levels = metadata$names), 
+                              factor(sample2, levels = metadata$names), 
+                              fill = perc_identical)) + 
+  geom_tile() + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                     color = metadata$group),
+        axis.text.y = element_text(color = metadata$group)) +
+  xlab("sample") + ylab("sample") + 
+  scale_fill_viridis(discrete=FALSE)
+p
+ggsave(file.path(resdir, "heatmap_ggplot_cassette_terminal_specific_perc_identical_predictions.pdf"), p)
+```
+
+
+We plot a separate heatmap for each of the three event types.
+```{r}
+plot_heatmap <- function(m, title = "", filename){
+  n <- seq_len(ncol(m))
+  id <- expand.grid(n , n)
+  res_mat <- matrix(colSums(m[ ,id[,1]] & m[ ,id[,2]]), ncol = length(n))
+  rownames(res_mat) <- colnames(m)
+  colnames(res_mat) <- colnames(m)
+  ## divide the count matrix by the normalization matrix with the min of both pairs in each cell
+  sum_mat <- matrix(pmin(colSums(m[ ,id[,1]]), colSums(m[ ,id[,2]])), ncol = length(n))
+  norm_mat <- res_mat/sum_mat*100
+  diag(norm_mat) <- NA
+  
+  norm_mat_long <- norm_mat %>% as.data.frame %>%
+    tibble::rownames_to_column("sample1") %>%
+    tidyr::gather(sample2, perc_identical, -sample1, factor_key=TRUE) %>%
+    dplyr::mutate(sample1 = factor(sample1, levels = metadata$names),
+                  sample2 = factor(sample2, levels = metadata$names))
+  levels(norm_mat_long$sample1) <- metadata$sample_nr ## only use sample nr
+  levels(norm_mat_long$sample2) <- metadata$sample_nr
+  
+  p <- ggplot(norm_mat_long, aes(x = sample1, sample2, fill = perc_identical)) + 
+    geom_tile() + 
+    theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                       color = metadata$group),
+          axis.text.y = element_text(color = metadata$group)) +
+    xlab("sample") + ylab("sample") + 
+    scale_fill_viridis(discrete=FALSE, name = "% identical\npredictions") + 
+    # scale_x_discrete(labels = metadata$sample_nr)) +
+    # scale_y_discrete(labels = metadata$sample_nr)) +
+    ggtitle(title)
+  print(p)
+  ggsave(filename, p, width = 5, height = 4)
+}  
+ 
+metadata$sample_nr <- str_split(metadata$names, "_", simplify = TRUE)[,1]
+  
+event_type <- c("cassette", "3'_terminal", "5'_terminal")
+for (i in event_type) {
+  m <- pred_comp %>% dplyr::filter(type == i)
+  m5 <- m %>% dplyr::filter(min_sup_reads == 5) %>%
+    dplyr::select(ends_with("_FCX"))
+  m9 <- m %>% dplyr::filter(min_sup_reads > 5 & min_sup_reads < 10) %>%
+    dplyr::select(ends_with("_FCX"))
+  m10 <- m %>% dplyr::filter(min_sup_reads >= 10) %>%
+    dplyr::select(ends_with("_FCX"))
+    
+  plot_heatmap(m5, title = i, file.path(resdir, paste0("heatmap_fraction_identical_predictions_", i, "_5reads.pdf")))
+  plot_heatmap(m9, title = i, file.path(resdir, paste0("heatmap_fraction_identical_predictions_", i, "_6to9reads.pdf")))
+  plot_heatmap(m10, title = i, file.path(resdir, paste0("heatmap_fraction_identical_predictions_", i, "_min10reads.pdf")))
+}
+
+
+m5 <- pred_comp %>% dplyr::filter(min_sup_reads == 5) %>%
+  dplyr::select(ends_with("_FCX"))
+m9 <- pred_comp %>% dplyr::filter(min_sup_reads > 5 & min_sup_reads < 10) %>%
+  dplyr::select(ends_with("_FCX"))
+m10 <- pred_comp %>% dplyr::filter(min_sup_reads >= 10 & min_sup_reads <100) %>%
+  dplyr::select(ends_with("_FCX"))
+m100 <- pred_comp %>% dplyr::filter(min_sup_reads >= 100) %>%
+  dplyr::select(ends_with("_FCX"))
+m59 <- pred_comp %>% dplyr::filter(min_sup_reads >= 5 & min_sup_reads < 10) %>%
+  dplyr::select(ends_with("_FCX"))
+m6 <- pred_comp %>% dplyr::filter(min_sup_reads >= 6) %>%
+  dplyr::select(ends_with("_FCX"))
+min5 <- pred_comp %>% dplyr::filter(min_sup_reads >= 5) %>%
+  dplyr::select(ends_with("_FCX"))
+
+## Figures for paper:
+plot_heatmap(m5, title = "", file.path(resdir, paste0("heatmap_perc_identical_predictions_5reads.pdf")))
+plot_heatmap(m9, title = "", file.path(resdir, paste0("heatmap_perc_identical_predictions_6to9reads.pdf")))
+plot_heatmap(m10, title = "", file.path(resdir, paste0("heatmap_perc_identical_predictions_10to99reads.pdf")))
+plot_heatmap(m100, title = "", file.path(resdir, paste0("heatmap_perc_identical_predictions_min100reads.pdf")))
+plot_heatmap(m59, title = "", file.path(resdir, paste0("heatmap_perc_identical_predictions_5to9reads.pdf")))
+plot_heatmap(min5, title = "", file.path(resdir, paste0("heatmap_perc_identical_predictions_min5reads.pdf")))
+
+## number of predictions with specific number of minimal supporting reads
+## total number of predictions
+nrow(pred_comp)
+pred_comp %>% dplyr::filter(min_sup_reads == 5) %>% nrow
+pred_comp %>% dplyr::filter(min_sup_reads >= 6) %>% nrow
+pred_comp %>% dplyr::filter(min_sup_reads >= 6 & min_sup_reads < 10) %>% nrow
+pred_comp %>% dplyr::filter(min_sup_reads >= 10 & min_sup_reads <100) %>% nrow
+pred_comp %>% dplyr::filter(min_sup_reads >= 100) %>% nrow
+```
+
+
+### Number of overlapping predictions between samples
+What if we only require that the predictions overlap?
+```{r, cache = TRUE}
+## We can compute the number of overlapping predictions in pairs of samples with subsetByOverlaps --> we only record the number of overlaps and not the actual predictions --> directly construct the overlap matrix (2 for loops)
+olap_mat <- matrix(NA, ncol = length(names(preds)), nrow = length(names(preds)))
+rownames(olap_mat) <- names(preds)
+colnames(olap_mat) <- names(preds)
+
+for (i in rownames(olap_mat)) {
+  for(j in colnames(olap_mat)){
+    a <- unique(GRanges(preds[[i]]))
+    b <- unique(GRanges(preds[[j]]))
+    olap_mat[i, j] <- length(subsetByOverlaps(a,b,ignore.strand = FALSE, 
+                                              type = "any")) / min(length(a), 
+                                                                   length(b))
+  }
+}
+diag(olap_mat) <- NA
+
+olap_mat_long <- olap_mat %>% as.data.frame %>%
+  tibble::rownames_to_column("sample1") %>%
+  tidyr::gather(sample2, perc_overlap, -sample1, factor_key=TRUE)
+
+p <- ggplot(olap_mat_long, aes(x = factor(sample1, levels = metadata$names), 
+                              factor(sample2, levels = metadata$names), 
+                              fill = perc_overlap)) + 
+  geom_tile() + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                     color = metadata$group),
+        axis.text.y = element_text(color = metadata$group)) +
+  xlab("sample") + ylab("sample") + 
+  scale_fill_viridis(discrete=FALSE)
+p
+ggsave(file.path(resdir, "heatmap_ggplot_perc_overlapping_predictions.pdf"), p)
+```
+The effect is better visible in this plot. The sALs samples have higher numbers of overlapping predictions than the control samples. This is expected, because the control samples should not contain many novel exons, whereas the sALS samples should. The fact that the sALS predictions overlap between samples indicates that these novel exons are cause by a common mechanism (TDP-43 pathology).
+
+
+### Numbers and Examples of shared predictions between groups
+
+How many predictions are common between samples? 
+How many predictions appear in 2, 3, 4, ... n samples?
+
+```{r, dependson="identical-start-end"}
+## per group, how many predictions are shared between 2, 3, .., n samples?
+m_als <- m[, as.character(metadata$names[metadata$group == "sALS"])]
+m_ctr <- m[,as.character(metadata$names[metadata$group == "control"])]
+
+## remove all rows without a TRUE
+m_als <- m_als[rowSums(m_als)!=0,]
+m_ctr <- m_ctr[rowSums(m_ctr)!=0,]
+
+## percentage of predictions that appear in a specific number of samples
+perc_als <- rowSums(m_als) %>% table / nrow(m_als) * 100
+perc_ctr <- rowSums(m_ctr) %>% table / nrow(m_ctr) * 100
+perc_als
+perc_ctr
+## barplot with the number samples that share a prediction
+tmp <- data.frame(nr_samples = factor(1:10),
+                  sALS = c(perc_als), control = c(perc_ctr, 0))
+tmp <- tmp %>% tidyr::gather(group, perc_predictions, -nr_samples, factor_key=TRUE)
+
+p <- ggplot(tmp, aes(x = nr_samples, y = perc_predictions, fill = group)) + 
+  geom_col(position = "dodge") + 
+  theme_bw(base_size = 16) 
+  # scale_y_log10()
+p
+ggsave(file.path(resdir, "barplot_perc_shared_predictions.pdf"), p)
+```
+Slightly more predictions are common to more than one sample in the sALS group than the control group.
+
+
+How many predictions are shared in at least half of the samples within a group?
+```{r}
+rowSums(m_als[rowSums(m_als) >= ncol(m_als)/2,]) %>% table %>% sum
+rowSums(m_ctr[rowSums(m_ctr) >= ncol(m_ctr)/2,]) %>% table %>% sum
+```
+
+
+How many predictions are shared across groups?
+```{r}
+rowSums(m) %>% table
+```
+The novel exons that appear in all 19 samples are probably unannotated splicing events. 
+
+We write a table with the location of all novel exons sorted by the number of samples in which they occur.
+
+```{r}
+pred_comp[,1:4]
+pred_comp$nr_samples <- rowSums(pred_comp[,5:ncol(pred_comp)])
+pred_comp <- pred_comp %>% mutate(nr_samples = rowSums(pred_comp %>% select(ends_with("_FCX"))))
+
+pred_comp$nr_sALS_samples <- rowSums(pred_comp[, as.character(metadata[metadata$group == "sALS", "names"])])
+pred_comp$nr_control_samples <- rowSums(pred_comp[, as.character(metadata[metadata$group == "control", "names"])])
+
+pred_comp %>% dplyr::select(-ends_with("FCX")) %>%
+  arrange(desc(nr_samples), desc(nr_sALS_samples), desc(nr_control_samples), desc(max_sup_reads), desc(min_sup_reads)) %>% 
+  dplyr::select(c(seqnames, start, end, strand, lend, rstart), everything()) %>% 
+  write.table(file = file.path(resdir, "novel_exons_list", 
+                               "all_predictions_nr_samples.txt"),
+              quote = FALSE, row.names = FALSE, sep = "\t")
+```
+
+
+#### Examples
+Examples of the novel exons that were predicted in all 19 samples:
+- exisiting cassette exon?
+- cassette exon with missing annotation
+
+Examples of novel exons that were only predicted in one of the two groups:
+```{r}
+pred_comp %>% dplyr::filter(nr_control_samples == 0) %>% 
+  arrange(desc(nr_samples), desc(nr_sALS_samples), desc(nr_control_samples)) %>%
+  head
+
+## Are there any cassette exons specific to the sALS samples?
+pred_comp %>% dplyr::filter(nr_control_samples == 0) %>% 
+  arrange(desc(nr_samples), desc(nr_sALS_samples), desc(nr_control_samples)) %>% 
+  pull(type) %>% table
+```
+
+Most of these examples also have a few reads in the control cases, but just not enough to get detected.
+They predictions have quite low numbers of supporting reads (<50). 
+
+sALS specific:
+
+control specific:
+
+
+What if we get rid of the predictions with less than 10 minimal supporting reads?
+```{r}
+pred_comp %>% arrange(desc(nr_samples), desc(nr_sALS_samples), 
+                      desc(nr_control_samples), desc(max_sup_reads), 
+                      desc(min_sup_reads)) %>%  
+  dplyr::filter(min_sup_reads >= 10) %>% head
+
+
+m <- pred_comp %>% dplyr::filter(min_sup_reads >= 6) %>%
+  dplyr::select(ends_with("_FCX"))
+n <- seq_len(ncol(m))
+id <- expand.grid(n , n)
+
+res_mat <- matrix(colSums(m[ ,id[,1]] & m[ ,id[,2]]), ncol = length(n))
+rownames(res_mat) <- colnames(m)
+colnames(res_mat) <- colnames(m)
+## divide the count matrix by the normalization matrix with the min of both pairs in each cell
+sum_mat <- matrix(pmin(colSums(m[ ,id[,1]]), colSums(m[ ,id[,2]])), ncol = length(n))
+norm_mat <- res_mat/sum_mat
+diag(norm_mat) <- NA
+
+norm_mat_long <- norm_mat %>% as.data.frame %>%
+  tibble::rownames_to_column("sample1") %>%
+  tidyr::gather(sample2, perc_identical, -sample1, factor_key=TRUE)
+
+p <- ggplot(norm_mat_long, aes(x = factor(sample1, levels = metadata$names), 
+                              factor(sample2, levels = metadata$names), 
+                              fill = perc_identical)) + 
+  geom_tile() + 
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1, 
+                                                     color = metadata$group),
+        axis.text.y = element_text(color = metadata$group)) +
+  xlab("sample") + ylab("sample") + 
+  scale_fill_viridis(discrete=FALSE)
+p
+ggsave(file.path(resdir, "heatmap_ggplot_cassette_terminal_specific_min6reads_perc_identical_predictions.pdf"), p)
+```
+
+Supplementary material:
+Does the percentage of identical prediction change with expression level?
+
+```{r}
+## number of predictions vs. expression level (min # supporting reads)
+
+d <- table(pred_comp$min_sup_reads)
+as.data.frame(d) %>% dplyr::rename(min_reads = Var1, n_preds = Freq) %>%
+  dplyr::mutate(min_reads = as.integer(as.character(min_reads)), 
+                n_preds = as.integer(as.character(n_preds))) %>%
+  ggplot(aes(x = min_reads, y = n_preds)) +
+           geom_point() + 
+           scale_y_log10() + 
+           scale_x_log10() + 
+  theme_bw(base_size = 14) +
+  xlab("Number of supporting reads") +
+  ylab("Number of predictions")
+         
+
+## plot by sample
+## table with the number of predictions per # supporting reads
+d <- as.data.frame(table(preds[[1]]$min_reads)) %>% 
+  dplyr::rename(min_reads = Var1, n_preds = Freq) %>%
+  dplyr::mutate(min_reads = as.integer(as.character(min_reads)), 
+                n_preds = as.integer(as.character(n_preds)),
+                sample = names(preds)[1]) %>% head
+
+for (i in 2:length(preds)){
+  tmp <- as.data.frame(table(preds[[i]]$min_reads)) %>% 
+  dplyr::rename(min_reads = Var1, n_preds = Freq) %>%
+  dplyr::mutate(min_reads = as.integer(as.character(min_reads)), 
+                n_preds = as.integer(as.character(n_preds)),
+                sample = names(preds)[i])
+  d <- rbind(d, tmp)
+}
+d$sample <- as.factor(d$sample)
+d$group <- as.factor(metadata$group[match(d$sample, metadata$names)])
+d$sample <- str_split(d$sample, "_", simplify = TRUE)[,1]
+
+p <- ggplot(d, aes(x = min_reads, y = n_preds, color = sample, shape = group)) +
+  geom_point(alpha = 0.4, size = 3) + 
+  scale_y_log10() + 
+  scale_x_log10() + 
+  theme_bw(base_size = 14) +
+  xlab("Number of supporting reads") +
+  ylab("Number of predictions") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1), ncol = 2))
+p
+
+ggsave(file.path(resdir, "min_reads_vs_n_preds.pdf"), p,
+       width = 7, height = 4.5)
+```
+
+
+
+## Cryptic exons
+We specifically look for predictions in regions without any annotated exons.
+```{r}
+gtf <- import(gtf)
+no_olap <- subsetByOverlaps(GRanges(pred_comp), 
+                            gtf[gtf$type %in% c("exon", "five_prime_utr", 
+                                                "three_prime_utr")], 
+                            invert = TRUE)
+no_olap %>% mcols %>% as.data.frame %>% 
+  dplyr::filter(nr_control_samples == 0) %>% 
+  arrange(desc(nr_samples), desc(nr_sALS_samples), desc(nr_control_samples)) %>%
+  head
+```
+
+
+##  Microexons
+What are the predicted microexons and are any of them specific for sALS samples?
+```{r}
+summary(pred_comp$end - pred_comp$start +1 <= 27 )
+
+pred_comp %>% dplyr::mutate(exon_len = end - start +1) %>% 
+  dplyr::filter(exon_len <= 27) %>%
+  dplyr::select(ends_with("_FCX")) %>% colSums
+
+## sALS specific microexons
+pred_comp %>% dplyr::mutate(exon_len = end - start +1) %>% 
+  dplyr::filter(exon_len <= 27, nr_control_samples == 0) %>%
+  arrange(desc(nr_samples), desc(nr_sALS_samples), 
+                      desc(nr_control_samples), desc(max_sup_reads), 
+                      desc(min_sup_reads)) %>%  head
+```
+
+
+What are the novel exons that are shared between 9 or 10 samples per group? How many supporting reads do they have?
+What is the distribution of supporting reads for predictions common to different numbers of samples?
+Are the predictions that appear in many samples supported by more reads?
+```{r}
+pred_comp %>% group_by(nr_samples) %>%
+  summarize(mean_min_reads = mean(min_sup_reads), 
+            mean_max_reads = mean(max_sup_reads))
+
+pred_comp %>% dplyr::filter(nr_samples == 19) %>% pull(min_sup_reads) %>% summary
+pred_comp %>% dplyr::filter(nr_samples == 19) %>% pull(max_sup_reads) %>% summary
+```
+The predictions common to many samples have higher min and max number of supporting reads.
+
+
+## Summary
+There are not many sALS specific novel exons. Most events are shared between groups and even the cases that are specific to a few sALS samples have some read coverage in the control samples.
+There are many cases where the Ensembl annotation that we used for mapping and prediction is not correct. It is missing exons or terminal exons (the gene is longer than annotated) and discerns simply finds these missing annotations!
+
+Many of the genes with microexons are related to multiple sclerosis? (EVI5)
+
+
+
+
