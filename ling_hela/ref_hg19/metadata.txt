@@ -1,0 +1,3 @@
+names,type,treatment
+SRR2002765,PE,control
+SRR2002766,PE,TDP43_KD

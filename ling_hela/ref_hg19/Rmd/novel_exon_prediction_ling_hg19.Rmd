@@ -1,0 +1,1120 @@
+---
+title: "Novel exon prediction in Ling et al. data"
+author: "Katharina Hembach"
+date: "24/06/2020"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(autodep = TRUE, cache = FALSE, dev = "png",
+                      dev.args = list(png = list(type = "cairo")))
+```
+
+```{r, message = FALSE}
+suppressPackageStartupMessages({
+  library(DISCERNS)
+  library(here)
+  library(GenomicRanges)
+  library(GenomicFeatures)
+  library(rtracklayer)
+  library(ggplot2)
+  library(ggforce)
+  library(UpSetR)
+  library(GenomicAlignments)
+  library(dplyr)
+})
+```
+
+## Set up
+
+```{r set-up}
+## Make sure that here finds the correct root directory
+# set_here("../")
+gtf <- here("reference/Homo_sapiens.GRCh37.87.gtf")
+outdir <- here("output")
+resdir <- here("results")
+```
+
+
+## Data set
+
+We want to predict novel exons in the RNA-seq data from (Ling et al. paper)[https://science.sciencemag.org/content/349/6248/650.abstract]. 
+The data consists of two samples from HeLa cells: one control and one TDP-43 knock down (siRNA).
+We expect to find novel splicing events and cryptic exons in the TDP-43 KD sample.
+The libraries were processed with the `TruSeq Stranded Total RNA Library Prep Kit (Illumina)` (as state in the supplement).
+
+
+## Prepare annotation
+
+We prepare the genome annotation:
+```{r anno, cache = TRUE}
+anno <- prepare_annotation(gtf)
+names(anno)
+```
+
+## Novel exon prediction
+
+We predict novel exons based on the BAM file and the SJ.out.tab files.
+The strandedness is "reverse" because the libraries were prepared with the Illumina TruSeq protocol. 
+
+### SRR2002765
+
+This the control sample from WT Hela cells.
+```{r SRR2002765}
+sj <- file.path(outdir, "STAR", "SRR2002765", "SRR2002765_pass2_SJ.out.tab")
+bam <- file.path(outdir, "STAR", "SRR2002765", "SRR2002765_pass2_Aligned.sortedByCoord.out.bam")
+
+if(!file.exists(here("Rmd/rds/novel_control.rds"))){
+  start_time <- Sys.time()
+  novel_control <- find_novel_exons(sj_filename = sj, annotation = anno, 
+                                    min_unique = 5, bam = bam, overhang_min = 6, 
+                                    lib_type = "PE", stranded = "reverse", 
+                                    yield_size = 10000000, read_length = 100, 
+                                    cores = 20, tile_width = 1e8)
+  print(Sys.time() - start_time)  
+  saveRDS(novel_control, here("Rmd/rds/novel_control.rds"))
+} else {
+  novel_control <- readRDS(here("Rmd/rds/novel_control.rds"))
+  novel_control <- distinct(novel_control, seqnames, lend, start, end, rstart, 
+                            .keep_all= TRUE)
+}
+
+dim(novel_control)
+head(novel_control)
+```
+
+### SRR2002766
+
+This is the Hela TDP-43 knockdown sample. We expect to find cryptic exons in this sample.
+```{r SRR2002766}
+sj <- file.path(outdir, "STAR", "SRR2002766", "SRR2002766_pass2_SJ.out.tab")
+bam <- file.path(outdir, "STAR", "SRR2002766", "SRR2002766_pass2_Aligned.sortedByCoord.out.bam")
+
+if(!file.exists(here("Rmd/rds/novel_kd.rds"))){
+  start_time <- Sys.time()
+  novel_kd <- find_novel_exons(sj_filename = sj, annotation = anno,
+                               min_unique = 5, bam = bam, overhang_min = 6, 
+                               lib_type = "PE", stranded = "reverse",
+                               yield_size = 10000000, read_length = 100,
+                               cores = 20, tile_width = 1e8)
+  print(Sys.time() - start_time) 
+  saveRDS(novel_kd, here("Rmd/rds/novel_kd.rds"))
+} else {
+  novel_kd <- readRDS(here("Rmd/rds/novel_kd.rds"))
+  novel_kd <- distinct(novel_kd, seqnames, lend, start, end, rstart, 
+                       .keep_all= TRUE)
+}
+
+dim(novel_kd)
+head(novel_kd)
+```
+
+```{r, eval = FALSE, include = FALSE}
+## Why did we not predict the ce in gene PKN1?
+sj <- here("missing_prediction", "PKN1.SJ.out.tab")
+bam <- file.path(outdir, "STAR", "SRR2002766", "SRR2002766_pass2_Aligned.sortedByCoord.out.bam")
+annotation <- anno
+sj_filename <- sj
+introns <- anno[["introns"]]
+min_unique = 5
+exons <- anno[["exons"]]
+cores <- 20
+
+## the ce is in the list of predictions after prediction from single novel SJs!!
+## how did it get filtered out?
+
+ novel_kd <- find_novel_exons(sj_filename = sj, annotation = anno,
+                               min_unique = 5, bam = bam, overhang_min = 6, 
+                               lib_type = "PE", stranded = "reverse",
+                               yield_size = 10000000, read_length = 100,
+                               cores = 20, tile_width = 1e8)
+
+```
+
+
+### Novel exon filtering
+
+We need to compare the WT and TDP-43 KD samples, to remove novel exons that are found in both samples. These exons are not caused by th TDP-43 KD, but they are simply missing from the human genome annotation. The aim of this study is to find cryptic exons that are originating from the TDP KD. Thus, we are interested in the list of novel splicing events that are only found in the TDP KD sample but not the WT.
+
+
+### Comparison with cryptic exons from the paper
+
+We want to know if we predict the cryptic exons that were reported in the original paper. The supplement contains a list of 41 cryptic exons without strand information.
+
+The cryptic exons are using the hg19 genome annotation and I remapped them to GRCh38 using the (NCBI remapping service)[http://www.ncbi.nlm.nih.gov/genome/tools/remap/].
+
+```{r}
+ling <- read.table(here( "original_paper", "human_ce_location_hg19_GRCh38.txt"),
+                   header = TRUE)
+# convert to GRanges
+ling <- GRanges(ling$location_hg19, gene = ling$gene)
+## convert to Ensembl annotation
+seqlevelsStyle(ling) <- "Ensembl"
+```
+
+We save the location of the Ling ce as a BED file for visualization with IGV.
+```{r}
+export(ling, here("original_paper", "human_ce_hg19.bed"), format = "BED")
+```
+
+Also, we save our predictions as BED files so we can compare them to the Ling CE locations. We annotate each prediction with the type: cassette exon, 3' or 5' terminal exon
+
+```{r}
+novel_control$name <- "cassette"
+novel_control$name[is.na(novel_control$lend)] <- "5'_terminal"
+novel_control$name[is.na(novel_control$rstart)] <- "3'_terminal"
+export(GRanges(novel_control), here("results", "control_DISCERNS_unfiltered.bed"), format = "BED")
+
+novel_kd$name <- "cassette"
+novel_kd$name[is.na(novel_kd$lend)] <- "5'_terminal"
+novel_kd$name[is.na(novel_kd$rstart)] <- "3'_terminal"
+export(GRanges(novel_kd), here("results", "kd_DISCERNS_unfiltered.bed"), format = "BED")
+```
+
+We also write a text files with all novel exons, ordered by number of supporting reads:
+
+```{r}
+novel_control %>% arrange(desc(min_reads)) %>%
+  write.table(file = file.path(resdir, "control_DISCERNS.txt"), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+novel_kd %>% arrange(desc(min_reads)) %>%
+  write.table(file = file.path(resdir, "kd_DISCERNS.txt"), 
+              sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+
+Additionally, we add the predictions to the GTF file.
+```{r, eval = FALSE}
+if(!file.exists(here("results", "control_DISCERNS_unfiltered.gtf")) & 
+   !file.exists(here("results", "kd_DISCERNS_unfiltered.gtf"))){
+  anno1 <- import(gtf)
+  
+  gtf_control <- extend_gtf(anno1, novel_control, cores = 30)  ##3206401; new 3135258; now 3403178; type split 3498285; new package: 3344850
+  length(gtf_control)
+
+  gtf_kd <- extend_gtf(anno1, novel_kd, cores = 30)  ## 3164508; new 3101532; now 3311297; type split 3393805; new package: 3271513
+  length(gtf_kd)
+  
+  export(gtf_control, 
+         here("results", "control_DISCERNS_unfiltered.gtf"), format = "GTF")
+  export(gtf_kd,
+         here("results", "kd_DISCERNS_unfiltered.gtf"), format = "GTF")
+} else {
+  readRDS(here("results", "control_DISCERNS_unfiltered.gtf"))
+  readRDS(here("results", "kd_DISCERNS_unfiltered.gtf"))
+}
+```
+
+We sort and index the gtf files for visualization in IGV. For this, we use the [gff3sort.pl](https://github.com/billzt/gff3sort) and igvtools for indexing when loading the files into IGV.
+```{r, eval = FALSE}
+cmd <-  paste0("gff3sort.pl ", 
+               here("results", "control_DISCERNS_unfiltered.gtf"), 
+               " > ", 
+               here("results", "control_DISCERNS_unfiltered.sorted.gtf"))
+system(command = cmd)
+cmd <-  paste0("gff3sort.pl ", 
+               here("results", "kd_DISCERNS_unfiltered.gtf"), 
+               " > ", 
+               here("results", "kd_DISCERNS_unfiltered.sorted.gtf"))
+system(command = cmd)
+```
+
+
+
+### Stats of the novel exon predictions
+
+What is the distribution of the minimal number of supporting reads of each predictions?
+How many terminal and cassette exons did we predict?
+
+```{r}
+df_control <- data.frame(min_reads = novel_control$min_reads, 
+                         type = ifelse(is.na(novel_control$lend) | 
+                                         is.na(novel_control$rstart),
+                                       "terminal", "cassette_exon"),
+                         exon_length = novel_control$end - novel_control$start + 1)
+df_kd <- data.frame(min_reads = novel_kd$min_reads,
+                    type = ifelse(is.na(novel_kd$lend) | is.na(novel_kd$rstart),
+                                  "terminal", "cassette_exon"),
+                    exon_length = novel_kd$end - novel_kd$start + 1)
+## How many terminal and cassette exons?
+table(df_control$type)
+table(df_kd$type)
+
+df <- rbind(df_control, df_kd)
+df$sample <- c(rep("control", nrow(df_control)), rep("TDP-43 KD", nrow(df_kd)))
+p <- ggplot(df, aes(sample, y = min_reads))  +
+    geom_sina(aes(color = sample)) + 
+  stat_summary(fun.ymin = function(z) { quantile(z,0.25) },
+               fun.ymax = function(z) { quantile(z,0.75) },
+               fun.y = median, size = 0.8, alpha = 0.8) +
+  theme_bw(base_size = 16) + 
+  scale_y_log10() + 
+  theme(legend.position = "none") +
+  scale_color_brewer(palette = "Set2") + 
+  facet_wrap(vars(type))
+p
+# ggsave(here("results", "figures", "min_reads_per_prediction.pdf"), p)
+ggsave(here("results", "figures", "min_reads_per_prediction.png"), p, dpi = 300)
+```
+
+What is the length distribution of the predicted exons?
+```{r}
+summary(df_control$exon_length)
+summary(df_kd$exon_length)
+
+p <- ggplot(df, aes(sample, y = exon_length))  +
+  geom_sina(aes(color = sample)) + 
+  stat_summary(fun.ymin = function(z) { quantile(z,0.25) },
+               fun.ymax = function(z) { quantile(z,0.75) },
+               fun.y = median, size = 0.8, alpha = 0.8) +
+  theme_bw(base_size = 16) + 
+  scale_y_log10() + 
+  theme(legend.position = "none") +
+  scale_color_brewer(palette = "Set2") + 
+  facet_wrap(vars(type))
+p
+# ggsave(here("results", "figures", "exon_length_per_prediction.pdf"), p)
+ggsave(here("results", "figures", "exon_length_per_prediction.png"), p, dpi = 300)
+```
+How many microexons were predicted (<=27nts)
+```{r}
+table(df_control$exon_lengt <= 27)
+table(df_kd$exon_lengt <= 27)
+```
+
+What is the distribtion of supporting reads among the microexons?
+Sina plot with median and 25% and 75% quantiles.
+```{r}
+df$microexon <- ifelse(df$exon_length <= 27, "microexon",  ">27nts")
+
+p <- ggplot(df, aes(sample, y = min_reads))  +
+  geom_sina(aes(color = sample)) + 
+  stat_summary(fun.ymin = function(z) { quantile(z,0.25) },
+               fun.ymax = function(z) { quantile(z,0.75) },
+               fun.y = median, size = 0.8, alpha = 0.8) +
+  theme_bw(base_size = 16) + 
+  scale_y_log10() + 
+  theme(legend.position = "none") +
+  scale_color_brewer(palette = "Set2") + 
+  facet_grid(vars(microexon), vars(type))
+p
+# ggsave(here("results", "figures", "min_reads_per_prediction_me.pdf"), p)
+ggsave(here("results", "figures", "min_reads_per_prediction_me.png"), p, dpi = 300)
+```
+
+How many novel exons start/end in the same location. Maybe they should be merged?
+```{r}
+## Number of predicted exons with unique start positions
+nrow(novel_control)
+length(unique(novel_control$start))
+length(unique(novel_control$end))
+
+nrow(novel_kd)
+length(unique(novel_kd$start))
+length(unique(novel_kd$end))
+
+## Distribution of number of novel exons per start position
+summary(as.vector(table(novel_control$start)))
+summary(as.vector(table(novel_control$end)))
+
+summary(as.vector(table(novel_kd$start)))
+summary(as.vector(table(novel_kd$end)))
+```
+As expected, most start or end sites have only a single novel exon.
+
+## Examples of novel exons
+What are the novel exons with the highest number of supporting reads? 
+```{r}
+novel_control[which.max(novel_control$min_reads),]
+novel_kd[which.max(novel_kd$min_reads),]
+```
+Both are FPs because the intron inbetween the two exons is very short (~100nts). I need to check the distance between the read ends and make sure that it is < min_intron_length.
+
+What is the distribution of intron lengths in the human genome?
+```{r}
+introns <- anno[["introns"]]
+p <- ggplot(data.frame(intron_length = width(introns)), aes(intron_length)) + 
+  geom_histogram(bins = 150) +
+  scale_x_log10() + 
+  theme_bw(base_size = 20) +
+  geom_vline(xintercept = 21) + 
+  geom_vline(xintercept = 70, color = "red")
+p
+ggsave(here("results", "figures", "intron_length_density_hist.png"), p, dpi = 300)
+```
+
+If we use a cutoff of 70nts, then only 0.39% of all human introns are shorter!
+
+## Examples of microexons
+
+What are the microexons with the highest number of supporting reads? 
+```{r}
+me_control <- novel_control[novel_control$end - novel_control$start + 1 <= 27,]
+me_kd <- novel_kd[novel_kd$end - novel_kd$start + 1 <= 27,]
+
+# me_control[which.max(me_control$min_reads),]
+# me_kd[which.max(me_kd$min_reads),]
+me_control %>% arrange(desc(min_reads)) %>% head(n = 30)
+me_kd %>% arrange(desc(min_reads)) %>% head(n = 30)
+```
+What are the microexons with highest # supporting reads that are not terminal?
+```{r}
+me_control_cas <- me_control[!is.na(me_control$lend) & !is.na(me_control$rstart),]
+me_control_cas[which.max(me_control_cas$min_reads),]
+
+me_kd_cas <- me_kd[!is.na(me_kd$lend) & !is.na(me_kd$rstart),]
+me_kd_cas[which.max(me_kd_cas$min_reads),]
+```
+
+
+
+## Number of correct predictions
+
+How many novel exons are correct, wrong or completely missed in my predictions?
+
+```{r}
+##  Number the 41 Linget.al. cryptic exons
+ling$ID <- 1:length(ling)
+
+## overlap with the KD sample
+## identical overlap
+tp_both <- subsetByOverlaps(ling, GRanges(novel_kd), 
+                 ignore.strand = FALSE, type = "equal")$ID
+length(tp_both)
+## start identical
+tp_start <- subsetByOverlaps(ling, GRanges(novel_kd),  
+                 ignore.strand = FALSE, type = "start")$ID
+## end identical
+tp_end <- subsetByOverlaps(ling, GRanges(novel_kd),
+                 ignore.strand = FALSE, type = "end")$ID
+
+## number of partially correct predictions (start or end are correct)
+tp_start1 <- tp_start[!tp_start %in% tp_both]
+tp_end1 <- tp_end[!tp_end %in% tp_both]
+length(unique(c(tp_start1, tp_end1)))
+length(tp_start1)
+length(tp_end1)
+## one ce are in both start and end, but not in tp_both:
+#     ========    Ling ce
+#     ---         shared start
+#         ----    shared end
+
+## number or correct (>=1 correct coordinate) 
+tp <- c(tp_both, tp_start, tp_end)
+length(unique(tp))
+
+## All cryptic exons that have a prediction with all or only one of the 
+## coordinates are considered "correct"
+
+## wrong coordinates but overlap with prediction
+tp_olap <- subsetByOverlaps(ling, GRanges(novel_kd), 
+                 ignore.strand = FALSE, type = "any")$ID
+wrong_olap <- tp_olap[!tp_olap %in% c(tp, tp_start, tp_end)]
+## number of CE with wrong prediction boundaries 
+length(wrong_olap)
+
+## missing prediction: no prediction overlapping with the CE
+missing <- subsetByOverlaps(ling, GRanges(novel_kd), 
+                 ignore.strand = FALSE, type = "any", invert = TRUE)$ID
+## number of missing predictions
+length(missing)
+## We check how many of the missing Ling ce are already annotated in the latest Ensembl release
+## with >1 coordinate
+ling_annotated <- unique(c(subsetByOverlaps(ling[ling$ID %in% missing], anno[["exons"]], 
+                 ignore.strand = FALSE, type = "equal")$ID,
+                 subsetByOverlaps(ling[ling$ID %in% missing], anno[["exons"]], 
+                 ignore.strand = FALSE, type = "start")$ID,
+                 subsetByOverlaps(ling[ling$ID %in% missing], anno[["exons"]], 
+                 ignore.strand = FALSE, type = "end")$ID))
+length(ling_annotated)              
+## number of missing predictions (not yet annotated in the latest release)
+fn <- missing[!missing %in% ling_annotated]
+length(fn)
+```
+
+### Comparison DISCERNS and Ling et al. cryptic exons
+
+We label all cryptic exons from Ling et al. to indicate if they compare to DISCERNS predictions
+```{r}
+ling$correct_start <- ifelse(ling$ID %in% tp_start, TRUE, FALSE)
+ling$correct_end <- ifelse(ling$ID %in% tp_end, TRUE, FALSE)
+ling$correct_start_end <- ifelse(ling$ID %in% tp_both, TRUE, FALSE)
+ling$is_annotated <- ifelse(ling$ID %in% ling_annotated, TRUE, FALSE)
+
+ling$label <- NA
+ling$label[tp_start] <- "start"
+ling$label[tp_end] <- "end"
+ling$label[tp_both] <- "both"
+ling$label[wrong_olap] <- "wrong_olap"
+ling$label[missing] <- "missing"
+ling$label[ling_annotated] <- "annotated"
+
+ling %>% as.data.frame %>% 
+  write.table(file = here("results", "ling_ce_DISCERNS.txt"), sep = "\t", 
+              row.names = FALSE, quote = FALSE)
+```
+
+
+
+## MA-plot of the novel predictions
+
+We create a MA-plot from the list of novel predictions. Each novel exon is one point and we count the number of supporting reads that overlap with the novel exon in both samples. 
+
+Or we plot the number of supporting reads in both samples as the x- and y-axis. We extract the number of supporting reads of each splice junction from the SJ.out.tab file from STAR. 
+We also label the predicted exons to indicate if they were predicted in both or only one of the samples.
+
+```{r}
+
+## Read the SJ.out.tab files so we can add the number of supporting reads for
+## the exons that were only predicted in one sample
+sj_control <- file.path(outdir, "STAR", "SRR2002765", "SRR2002765_pass2_SJ.out.tab")
+sj_control <- read.table(sj_control, header = TRUE)
+colnames(sj_control) <- c("seqnames", "start", "end", "strand", "motif", "annotated",
+                    "unique", "multimapping", "maxoverhang")
+#strand: (0: undefined, 1: +, 2: -)
+sj_control$strand <- c("*", "+", "-")[sj_control$strand + 1]
+  
+sj_kd <- file.path(outdir, "STAR", "SRR2002766", "SRR2002766_pass2_SJ.out.tab")
+sj_kd <- read.table(sj_kd, header = TRUE)
+colnames(sj_kd) <- c("seqnames", "start", "end", "strand", "motif", "annotated",
+                    "unique", "multimapping", "maxoverhang")
+sj_kd$strand <- c("*", "+", "-")[sj_kd$strand + 1]
+
+
+
+## List of all predicted exons We merge the cassette exons based on the 4
+## coordinates and the terminal exon on only the novel SJ, but not the end of
+## the exon. The end is anyways only an estimate based on the longest mapped
+## overhang!
+
+## split the predictions into the 3 types
+s_control <- split(novel_control, novel_control$name)
+s_kd <- split(novel_kd, novel_kd$name)
+
+novel_cassette <- s_control[["cassette"]] %>% full_join(s_kd[["cassette"]], 
+             by  = c("seqnames", "lend", "start", "end", "rstart", "strand", "name"),  
+             suffix = c(".control", ".kd"))
+novel_5terminal <- s_control[["5'_terminal"]] %>% full_join(s_kd[["5'_terminal"]], 
+             by  = c("seqnames", "end", "rstart", "strand", "name"),  
+             suffix = c(".control", ".kd"))
+novel_3terminal <- s_control[["3'_terminal"]] %>% full_join(s_kd[["3'_terminal"]], 
+             by  = c("seqnames", "lend", "start", "strand", "name"),  
+             suffix = c(".control", ".kd"))
+## If a terminal exon is predicted in both samples, we take the exon end coordinates of the longer prediction
+novel_5terminal$start <- pmin(novel_5terminal$start.control, 
+                            novel_5terminal$start.kd, na.rm = TRUE)
+novel_5terminal$lend <- NA
+novel_5terminal <- novel_5terminal %>% 
+  select(-c("start.control", "start.kd", "lend.control", "lend.kd"))
+
+novel_3terminal$end <- pmax(novel_3terminal$end.control, 
+                            novel_3terminal$end.kd, na.rm = TRUE)
+novel_3terminal$rstart <- NA
+novel_3terminal <- novel_3terminal %>% 
+  select(-c("end.control", "end.kd", "rstart.control", "rstart.kd"))
+
+novel <- rbind(novel_cassette, novel_5terminal, novel_3terminal) %>%
+  rename(type = name) %>% mutate(predicted = "both")
+
+
+## The novel exons that are missing from the control sample
+ind <- is.na(novel$min_reads.control)
+novel$predicted[ind] <- "KD"
+
+key_sj <- with(sj_control, paste(seqnames, start - 1, end + 1, strand, sep = "."))
+key_ne_l <- paste(novel[ind, "seqnames"], novel[ind, "lend"], novel[ind, "start"],
+                  novel[ind, "strand"], sep = ".")
+key_ne_r <- paste(novel[ind, "seqnames"], novel[ind, "end"], novel[ind, "rstart"],
+                  novel[ind, "strand"], sep = ".")
+
+novel[ind, "unique_left.control"] <- sj_control$unique[match(key_ne_l, key_sj)]
+novel[ind, "unique_right.control"] <- sj_control$unique[match(key_ne_r, key_sj)]
+
+## Determine the minimal number of supporting reads
+i <- ind & novel$type == "cassette" 
+novel$min_reads.control[i] <- pmin(novel$unique_left.control[i], 
+                                   novel$unique_right.control[i])
+i <- ind & novel$type == "5'_terminal" 
+novel$min_reads.control[i] <- novel$unique_right.control[i]
+i <- ind & novel$type == "3'_terminal"
+novel$min_reads.control[i] <- novel$unique_left.control[i]
+
+## if an exon has 0 supporting reads, min_reads is set to 0
+novel$min_reads.control[is.na(novel$min_reads.control)] <- 0
+
+
+## The novel exons that are missing from the kd sample
+ind <- is.na(novel$min_reads.kd)
+novel$predicted[ind] <- "control"
+
+key_sj <- with(sj_kd, paste(seqnames, start - 1, end + 1, strand, sep = "."))
+key_ne_l <- paste(novel[ind, "seqnames"], novel[ind, "lend"], novel[ind, "start"],
+                  novel[ind, "strand"], sep = ".")
+key_ne_r <- paste(novel[ind, "seqnames"], novel[ind,"end"], novel[ind, "rstart"],
+                  novel[ind, "strand"], sep = ".")
+
+novel[ind, "unique_left.kd"] <- sj_kd$unique[match(key_ne_l, key_sj)]
+novel[ind, "unique_right.kd"] <- sj_kd$unique[match(key_ne_r, key_sj)]
+
+## Determine the minimal number of supporting reads
+i <- ind & novel$type == "cassette" 
+novel$min_reads.kd[i] <- pmin(novel$unique_left.kd[i], 
+                                   novel$unique_right.kd[i])
+i <- ind & novel$type == "5'_terminal" 
+novel$min_reads.kd[i] <- novel$unique_right.kd[i]
+i <- ind & novel$type == "3'_terminal"
+novel$min_reads.kd[i] <- novel$unique_left.kd[i]
+
+
+## if an exon has 0 supporting reads, min_reads is set to 0
+novel$min_reads.kd[is.na(novel$min_reads.kd)] <- 0
+```
+
+## Comparison of novel exons from control and KD sample
+### UpSet plot
+How many novel exons are detected in both samples, how many are specific for control or KD?
+For cassette exons, we compare all 4 coordinates. For terminal exons, we only compare the novel SJ, but not the end of the terminal exon!
+```{r}
+## Generate a key for each prediction
+control_keys <- novel %>% dplyr::filter(predicted %in% c("both", "control")) %>% 
+  within(., b <- paste0(seqnames, lend, start, end, rstart, strand)) %>% pull(b)
+kd_keys <- novel %>% dplyr::filter(predicted %in% c("both", "KD")) %>% 
+  within(., b <- paste0(seqnames, lend, start, end, rstart, strand)) %>% pull(b)
+ 
+## Upset plot
+listInput <- list(control = control_keys, KD = kd_keys)
+upset(fromList(listInput), keep.order = TRUE,  order.by = "degree", 
+      point.size = 3, line.size = 1.5, text.scale = 1.8)
+
+pdf(here("results", "figures", "upset_common_predictions.pdf"), 
+    width = 6, height = 5)
+upset(fromList(listInput), keep.order = TRUE,  order.by = "degree", 
+      point.size = 3, line.size = 1.5, text.scale = 1.8)
+dev.off()
+```
+
+### Comparison of the minimal number of supporting reads
+We plot the number of minimal supporting reads per novel exon in the control and KD sample and color by prediction source.
+```{r}
+p <- ggplot(novel, aes(x = log10(min_reads.control + 1), 
+                       y = log10(min_reads.kd + 1), color = predicted)) + 
+  geom_point(alpha = 0.4) + 
+  theme_bw(base_size = 20) + 
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+p
+ggsave(here("results", "figures", "min_reads_contro_vs_kd.png"), p, dpi = 300)
+
+```
+
+We can also create an MA-like plot, with log2(min_reads.control) + log2(min_reads.kd) on the x-axis and log2(min_reads.kd) - log2(min_reads.control).
+```{r}
+p <- ggplot(novel, aes(x = log2(min_reads.control + 1) + log2(min_reads.kd + 1), 
+                       y = log2(min_reads.kd + 1) - log2(min_reads.control + 1), 
+                       color = predicted)) + 
+  geom_point(alpha = 0.4) + 
+  theme_bw(base_size = 18) + 
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+p
+ggsave(here("results", "figures", "MA_plot_min_reads.png"), p, dpi = 300)
+
+```
+
+We color the predictions by the type of predictionL cassette exon, 5' terminal or 3' terminal
+```{r}
+p <- ggplot(novel, aes(x = log10(min_reads.control + 1), 
+                       y = log10(min_reads.kd + 1), color = type)) + 
+  geom_point(alpha = 0.4) + 
+  theme_bw(base_size = 20) + 
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+p
+ggsave(here("results", "figures", "min_reads_contro_vs_kd_type.png"), p, dpi = 300)
+```
+
+We color by the length of the predicted exon.
+```{r}
+p <- ggplot(novel, aes(x = log10(min_reads.control + 1), 
+                       y = log10(min_reads.kd + 1), color = predicted)) + 
+  geom_point(alpha = 0.4) + 
+  theme_bw(base_size = 20) + 
+  facet_wrap(vars(type))  + 
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+p
+ggsave(here("results", "figures", "min_reads_contro_vs_kd_predicted_type.png"), 
+       p, dpi = 300, width = 10, height = 5)
+```
+
+Color by origin of the prediction and facet wrap by type of exon
+```{r}
+p <- ggplot(novel, aes(x = log10(min_reads.control + 1), 
+                       y = log10(min_reads.kd + 1), color = type)) + 
+  geom_point(alpha = 0.4) + 
+  theme_bw(base_size = 20) + 
+  facet_wrap(vars(predicted))  + 
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+p
+ggsave(here("results", "figures", "min_reads_contro_vs_kd_predicted_type_1.png"), 
+       p, dpi = 300, width = 10, height = 5)
+```
+
+Facet wrap by type and origin of prediction
+```{r}
+p <- ggplot(novel, aes(x = log10(min_reads.control + 1), 
+                       y = log10(min_reads.kd + 1))) + 
+  geom_point(alpha = 0.4) + 
+  theme_bw(base_size = 20) + 
+  facet_wrap(vars(predicted, type))
+p
+ggsave(here("results", "figures", "min_reads_contro_vs_kd_predicted_type_2.png"), 
+       p, dpi = 300, width = 10, height = 12)
+```
+
+
+How many predictions overlap with a prediction in the other sample? Slight differences in the coordinates might explain why we have so many predictions specific for one dataset but with nearly equal amounts of reads in the other sample.
+
+```{r}
+overlapsAny(GRanges(novel_kd), GRanges(novel_control), type = "any") %>% table
+overlapsAny(GRanges(novel_control), GRanges(novel_kd), type = "any") %>% table
+```
+
+
+What are the novel exons from KD that have many reads in both samples?
+
+```{r}
+x <- novel[novel$predicted == "KD",]
+x[x$min_reads.kd > 100 & x$min_reads.control > 100,]
+
+```
+Why are these exons not detected in the control sample?
+Because these are intron retention events, where the number of supporting reads is wrongly computed, since we count all reads that support the SJ, independent if the support the intron retention event or not! 
+min_reads is “wrong” because these are intron retention events or cassette exons, that share both junctions with highly expressed genes. We should label them somehow?
+Predictions from reads/read pairs with 2 novel SJs.
+
+## Write batchscript to take IGV screenshots
+
+```{r, eval = FALSE}
+ce <- split(ling, ling$gene)
+out_dir <- here("IGV",  "screenshots")
+
+## take screenshots of region around all ce per gene
+snapshot_ce <- function(ce) {
+  s <- min(start(ce))
+  e <- max(end(ce))
+  
+  if(e-s < 1000){ ## at least 1000bp are shown
+    border <- floor(1000-(e-s)/2)
+  }
+  else{
+    border <- 150
+  }
+  s <- s - border
+  e <- e + border
+  
+  cat(paste0("goto chr", seqnames(ce)[1], ":", s, "-", e), 
+      fill = TRUE)
+  cat(paste0("snapshot ", ce$gene[1], "_", seqnames(ce)[1], "-", s, "-", e, ".png"), 
+      fill = TRUE)
+}
+
+sink(file.path(out_dir, "all_Ling_ce_IGV_gene.bat"))
+cat("snapshotDirectory /Users/katharina/PhD/discerns_paper/real_data_analysis/ref_hg19/IGV/screenshots\n")
+for(i in names(ce)){
+  snapshot_ce(ce[[i]])
+}
+sink()
+
+
+out_dir <- here("IGV",  "screenshots_gene")
+## take screenshot of every gene with a cryptic exon
+snapshot_gene <- function(ce, anno) {
+  g <- anno[anno$gene_name == ce$gene[1] & anno$type == "gene"]
+  s <- start(g) 
+  e <- end(g) 
+  
+  border <- ceiling((e-s)/100) ## 1 % of the gene width as border
+  s <- s - border
+  e <- e + border  
+  
+  cat(paste0("goto chr", seqnames(ce)[1], ":", s, "-", e), 
+      fill = TRUE)
+  cat(paste0("snapshot ", ce$gene[1], "_", seqnames(ce)[1], "-", s, "-", e, ".png"), 
+      fill = TRUE)
+}
+## Write the batch script to file
+sink(file.path(out_dir, "all_Ling_ce_IGV_gene.bat"))
+cat("snapshotDirectory /Users/katharina/PhD/discerns_paper/real_data_analysis/ref_hg19/IGV/screenshots_gene\n")
+for(i in names(ce)){
+  snapshot_gene(ce[[i]], anno1)
+}
+sink()
+
+```
+
+
+
+
+<!-- Novel exon  from KD with the highest number of supporting reads: -->
+<!-- chr17:16382243-16382568 -->
+<!-- There are reads in both samples, but most reads are on a different strand than the gene! -->
+
+<!-- Cassette exon that is probably wrong: two close exons with a retained intron. However, the intron is short and below my cutoff. -->
+<!-- chr1:220210489-220212887 -->
+
+<!-- 3' terminal exon: correct and predicted in both samples, but the end of the novel exon is slightly different! -->
+<!-- chr10:43396590-43409209 -->
+
+
+<!-- Cassette exon -->
+<!-- chr11:33722463-33736382 -->
+
+<!-- The exon is detected in both samples! But why is it counted as KD specific? -->
+<!-- ```{r} -->
+<!-- novel_control[which(novel_control$lend == 33722463),] -->
+<!-- sj_control[which(sj_control$end == 33736381),] -->
+<!-- ``` -->
+
+<!-- In the control, the predicted cassette exon has a different upstream rstart. Even though the other SJ also has supporting reads. -->
+<!-- But I can also find reads with two 2 SJ that support the cassette exon from KD! So why is it not in the output list? -->
+
+<!-- We read in all SJ reads that overlap with the region of the novel exon. Then we call the prediction function to see if really it does not predict the cassette exon in the control sample. -->
+
+<!-- ```{r, eval = FALSE} -->
+<!-- r <- x[x$min_reads.kd > 100 & x$min_reads.control > 100,] %>%  -->
+<!--   dplyr::slice(2) %>% GRanges -->
+
+<!-- ## read the SJ read in the novel cassette exon region -->
+<!-- bam <- file.path(outdir, "STAR", "SRR2002765", "SRR2002765_pass2_Aligned.sortedByCoord.out.bam") -->
+<!-- flag0 <- scanBamFlag(isProperPair = TRUE) -->
+<!-- param <- ScanBamParam(what = c("qname", "flag"), flag = flag0, which = r) -->
+<!-- reads <- readGAlignments(bam, param = param) -->
+
+<!-- reads <- reads[cigarOpTable(cigar(reads))[ ,"N"] > 0, ] -->
+<!-- bfbm <- bamFlagAsBitMatrix(mcols(reads)$flag, -->
+<!--                            bitnames = c("isMinusStrand", "isFirstMateRead")) -->
+<!-- mcols(reads)$isMinusStrand <- bfbm[ , "isMinusStrand"] -->
+<!-- mcols(reads)$isFirstMateRead <- bfbm[ , "isFirstMateRead"] -->
+<!-- # reverse -->
+<!-- ## isMinusStrand==0 & isFirstMateRead==0 --> "+" -->
+<!-- ## isMinusStrand==0 & isFirstMateRead==1 --> "-" -->
+<!-- ## isMinusStrand==1 & isFirstMateRead==0 --> "-" -->
+<!-- ## isMinusStrand==1 & isFirstMateRead==1 --> "+" -->
+<!-- strand(reads) <- ifelse(mcols(reads)$isMinusStrand + -->
+<!--                           mcols(reads)$isFirstMateRead == 0, "+", -->
+<!--                         ifelse(mcols(reads)$isMinusStrand + -->
+<!--                                  mcols(reads)$isFirstMateRead == 1, "-", -->
+<!--                                "+")) -->
+<!-- ## predict novel exons from reads with 2 SJs -->
+<!-- novel_exons <- predict_jr_exon(junc_reads = reads, annotation = anno) -->
+
+<!-- ## is our cassette exon amongst the predictions? -->
+
+
+<!-- ## Maybe it got removed by the post processing? -->
+
+
+<!-- ## Post filtering from the prediciton function -->
+<!-- ##  Add columns with the number of reads supporting the left and right splice -->
+<!-- ##  junction and the minimum of both -->
+<!-- key_sj <- with(sj_control, paste(seqnames, start - 1, end + 1, strand, sep = ".")) -->
+<!-- key_ne_l <- paste(novel_exons$seqnames, novel_exons$lend, novel_exons$start, -->
+<!--                   novel_exons$strand, sep = ".") -->
+<!-- key_ne_r <- paste(novel_exons$seqnames, novel_exons$end, novel_exons$rstart, -->
+<!--                   novel_exons$strand, sep = ".") -->
+
+<!-- novel_exons$unique_left <- sj_control$unique[match(key_ne_l, key_sj)] -->
+<!-- novel_exons$unique_right <- sj_control$unique[match(key_ne_r, key_sj)] -->
+
+<!-- ## none of the SJ has matching coordinates in SJ.out.tab, are coordinates shifted? -->
+<!-- sj_control[which(sj_control$start == 33717387),] -->
+<!-- ## the exon coordinates are the coordinates of the SJ!! So they are wrong and need to be shifted! -->
+
+
+
+<!-- ## We remove all predicted cassette exons where one of the junctions is not in -->
+<!-- ## SJ.out.tab, because these exons are most likely wrong (this only happens if -->
+<!-- ## we predict exons from reads). -->
+<!-- novel_exons <- novel_exons %>%  -->
+<!--   filter(!(!is.na(lend) & is.na(unique_left))) %>% -->
+<!--   filter(!(!is.na(rstart) & is.na(unique_right))) -->
+
+<!-- ## take the minimum read coverage of both junctions -->
+<!-- novel_exons$min_reads <- pmin(novel_exons$unique_left, -->
+<!--                               novel_exons$unique_right, na.rm = TRUE) -->
+<!-- novel_exons$ID <- 1:nrow(novel_exons) -->
+
+<!-- ## Filter all predictions with less than `min_unique` reads supporting both -->
+<!-- ## SJs -->
+<!-- novel_exons <- novel_exons %>% filter(min_reads >= min_unique) -->
+<!-- novel_exons -->
+
+
+
+<!-- ###  Prediction based on read pairs with each one junction -->
+<!-- novel_exons <- predict_jrp_exon(junc_reads = reads, annotation = anno) -->
+
+
+
+<!-- ## is the cassette exon among the predictions? -->
+<!-- ``` -->
+
+
+
+<!-- TODO: merge the terminal predictions based on the novel SJ, the end of the exon is not so important, because it is only an estimate! -->
+
+<!-- TODO: to which exons are the predictions connected? is there an exon and is it on the correct strand? -->
+
+<!-- TODO; check more examples! -->
+
+
+
+
+<!-- What are the novel exons from KD with many reads that have no supporting reads in control? -->
+<!-- ```{r} -->
+<!-- x[x$min_reads.control == 0,] %>% arrange(desc(min_reads.kd)) %>% head(n = 30) -->
+<!-- ``` -->
+<!-- These are all terminal exons! Are they wrong? -->
+
+<!-- This is a terminal exons that spanns multiple genes! -->
+<!-- chr12:52810800-52900588 -->
+<!-- It seems that the reads are wrongly mapped. The upstream exon has the same sequence as the novel terminal exon, so I don't think that the terminal exon is real! -->
+
+<!-- This is one of the Ling cryptic exons, but the predictions shouldn't be terminal exon s. -->
+<!-- chr1:1044986-1045161 -->
+
+<!-- Novel terminal exon. There are many reads supporting the SJ, but the exon should not be terminal!! -->
+<!-- chr12:56159622-56160125 -->
+
+
+<!-- What are the novel exons from KD that have 0 < reads < 5 in control? -->
+<!-- ```{r} -->
+<!-- x[x$min_reads.control > 0 & x$min_reads.control <5,] %>%  -->
+<!--   arrange(desc(min_reads.kd)) %>% head(n = 30) -->
+<!-- ``` -->
+
+<!-- These are mostly genes that are verly lowly expressed in control, but highly expressed in KD. Therefore, we only have few SJ read in control, but many in KD. but the events are mostly visible in both samples.  -->
+
+<!-- There is one interesting finding: SEPTIN7P2 -->
+<!-- Septin 11 is associated with sporadic FTLD! -->
+
+
+
+
+<!-- What are the novel exons from control that have a high logFC?  -->
+<!-- ```{r} -->
+
+<!-- ``` -->
+
+<!-- Why do some exons have equal numbers of supporting reads, but the exon was only predicted in one of the two samples? -->
+<!-- ```{r} -->
+
+<!-- ``` -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- It seems that the point clouds of predictions that were only discovered in one of the two samples but that have higher numnber of supporting reads in the sample where they were not detected are mostly cassette exons! -->
+
+<!-- We check a few of these examples to understand why they were only predicted in the sample with lower number of supporting reads. Also, we want to know if the predictions are correct or wrong. -->
+
+<!-- ```{r} -->
+<!-- novel[novel$type == "cassette" & novel$predicted == "KD" &  -->
+<!--         novel$min_reads.control > 10000,] -->
+
+<!-- which(novel$type == "cassette" & novel$predicted == "KD" &  -->
+<!--         novel$min_reads.control > 10000) -->
+<!-- ``` -->
+<!-- All of these examples have in common, that in the KD sample, one of the two SJs has very low numbers of supporting reads wherease the other SJ has many. In the control sample, both SJs have high numbers or supporting reads. -->
+
+<!-- Cassette exon with a read with 2 SJs. -->
+<!-- chr17:38848039-38850362 -->
+<!-- In control, this exon has many supporting reads. However, in IGV it looks like there are no supporting reads in control! -->
+
+<!-- Are the number of reads in the control SJ.out.tab file really this high? -->
+<!-- ```{r} -->
+<!-- sj_control[sj_control$seqnames == "17" & sj_control$start == 38848039+1 & sj_control$end == 38850125-1,] -->
+<!-- sj_control[sj_control$seqnames == "17" & sj_control$start == 38850214+1 & sj_control$end == 38850362-1,] -->
+<!-- ``` -->
+
+
+<!-- The first SJ is not in control, the number of supporting reads is the same as for the second SJ! -->
+
+
+
+
+<!-- ## Trying to fix the terminal exon prediction and GTF extension -->
+
+<!-- Ling ce with poly A site (terminal exon) -->
+<!-- We also predict a terminal exon, but in the GTF file we have a cassette exon -->
+<!-- ```{r} -->
+<!-- sj_out <- read.table(sj) -->
+<!-- colnames(sj_out) <- c("seqnames", "start", "end", "strand", "motif", "annotated", -->
+<!--                     "unique", "mutimapping", "maxoverhang") -->
+<!-- #strand: (0: undefined, 1: +, 2: -) -->
+<!-- sj_out$strand <- c("*", "+", "-")[sj_out$strand + 1] -->
+
+<!-- sj_out[sj_out$start == 65541152+1,] -->
+<!-- novel_kd[novel_kd$end == 65541152,] -->
+
+<!-- ## We test the exon extension with this terminal exon. The GTF should be extended by a terminal exon, but not a cassette exon! -->
+<!-- saveRDS(object = novel_kd[novel_kd$end == 65541152,], file = here("Rmd/rds/terminal_exon.rds") ) -->
+<!-- ``` -->
+
+<!-- We also test the internal exon extension -->
+<!-- ```{r} -->
+<!-- saveRDS(object = novel_kd[novel_kd$name == "cassette",][1:10,], file = here("Rmd/rds/cassette_exons.rds") ) -->
+<!-- ``` -->
+
+
+
+
+<!-- It seems that there are many predictions that overlap with existing exons. Are any of the predictions already annotated? -->
+<!-- Or why do some predictions not have transcripts -->
+<!-- ```{r} -->
+<!-- anno1 <- import(gtf) -->
+<!-- kd_anno <- subsetByOverlaps(GRanges(novel_kd), anno1, type = "equal")  ## 1521 novel exons are already annotated??? -->
+<!-- control_anno <- subsetByOverlaps(GRanges(novel_control), anno1, type = "equal")  ## 1914 -->
+
+<!-- kd_anno[1] -->
+<!-- # chr1:1022462-1041173 -->
+<!-- kd_anno[3] -->
+<!-- # chr1:1299356-1300158 -->
+<!-- kd_anno[9] -->
+<!-- # chr1:3490589-3493771 -->
+<!-- ``` -->
+<!-- The examples look reasonable: novel cassette exons that are annotated, but the left or right SJ is new! -->
+<!-- TODO: Maybe we should filter them out in our analysis, because they are not new exons, but only novel splicing events... -->
+<!-- However, they might be of interest to some users. We should mention this in the paper/vignette. -->
+
+
+
+<!-- TODO: what are the novel exons without a corresponding transcript in the GTF file? Why did we predict them? -->
+<!-- (rerun gtf extension, extract the novel exon IDS from the exon_name and filter out all novel exons without an entry in the extended GTF file) -->
+<!-- ```{r} -->
+
+<!-- ``` -->
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- TODO: -->
+<!-- X What are the novel exons with the highest number of supporting reads? Were they detected in Ling et al? Why not? -->
+<!-- X How many novel exons are detected in both samples, how many are specific for control or KD? -->
+<!-- X What is the distribution of supporting reads? -->
+<!-- X What is the length distribution of the novel exons? -->
+<!-- X How many novel exons start/end in the same location (possibly they should be merged?) -->
+<!-- (X) How many novel exons per gene? -->
+<!-- X What is the percentage of correct, wrong, missed predictions? -->
+
+<!-- What is still going wrong? -->
+<!-- (X) - gtf extension seems a big buggy, novel exons sometimes do not really show up in the extended GTF -->
+<!-- or we have cassette exons instead of terminal exons (CENPK and BLZF1) -->
+<!-- - We predict a novel exon, even though it looks like the exon is already annotated.  -->
+<!-- The check if the combination of reads with each one novel SJ already exists seems not to work properly? (e.g. KYNU) -->
+
+
+
+
+<!-- We add the gene names to the cryptic exons because they got lost in the remapping process. For this, we overlap the cryptic exons with the gene annotations. -->
+<!-- ```{r, eval = FALSE} -->
+<!-- anno1 <- import(gtf) -->
+<!-- genes <- anno1[mcols(anno1)$type == "gene"] -->
+<!-- ## convert ce to Ensembl chromosome names -->
+<!-- seqlevelsStyle(ling) <- "Ensembl" -->
+
+<!-- ## How many genes are overlapping with each ce? -->
+<!-- countOverlaps(ling, genes, type = "within") -->
+
+<!-- olap <- findOverlaps(ling, genes, type = "within") -->
+
+<!-- ling$gene_name <- subjectHits(olap)$gene_name -->
+<!-- ``` -->
+
+<!-- Unfortunately, some of the ce overlap with more than one gene. One ce does not overlap with a single annotated gene. -->
+<!-- We save the location of the Ling ce as a BED file for visualization with IGV. -->
+<!-- ```{r} -->
+<!-- export(ling, here("original_paper", "human_ce_grch38.bed"), format = "BED") -->
+<!-- ``` -->
+
+
+
+
+<!-- ## Fixing the gtf extension function -->
+<!-- # ## novel terminal exon, to test if the GTF extension works correctly -->
+<!-- # ne <- readRDS("/Volumes/kathi/real_data_analysis/ling_hela/Rmd/rds/terminal_exon.rds") -->
+<!-- # gtf <- "/Volumes/kathi/real_data_analysis/ling_hela/reference/Homo_sapiens.GRCh38.98.sorted.gtf" -->
+<!-- # pred <- ne -->
+<!-- #  -->
+<!-- # ## pred -->
+<!-- # # seqnames lend    start      end   rstart strand unique_left unique_right min_reads   ID -->
+<!-- # # 8266        5   NA 65541061 65541152 65542802      -          NA           34        34 9902 -->
+<!-- #  -->
+<!-- # ## tr_ids -->
+<!-- # # [1] "ENST00000514814" "ENST00000396679" "ENST00000242872" "ENST00000508421" "ENST00000510693" "ENST00000506282" -->
+<!-- # # [7] "ENST00000511841" "ENST00000509397" "ENST00000505960" "ENST00000515497" "ENST00000515873" "ENST00000502997" -->
+<!-- #  -->
+<!-- # seqn <- pred$seqnames -->
+<!-- # lend <- pred$lend -->
+<!-- # start <- pred$start -->
+<!-- # end <- pred$end -->
+<!-- # rstart <- pred$rstart -->
+<!-- # strand <- pred$strand -->
+<!-- #  -->
+<!-- # ## chr5:65541061-65541152 -->
+<!-- #  -->
+<!-- #  -->
+<!-- #  -->
+<!-- # ## write a GTF file with the new transcripts and the old ones wo we can check them in IGV -->
+<!-- # rtracklayer::export(c(new_tr, gtf[gtf$gene_name == "CENPK"]), "/Volumes/kathi/real_data_analysis/ling_hela/Rmd/rds/terminal_exon_extended.gtf" ) -->
+<!-- #  -->
+
+
