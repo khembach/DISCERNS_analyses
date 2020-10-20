@@ -1,0 +1,7 @@
+.DS_Store
+._*
+.Rhistory
+.snakemake/
+.Renviron
+~$*
+*_cache
