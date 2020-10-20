@@ -1,7 +1,7 @@
 # DISCERNS analyses
 
 This repository contains the code for the analysis of different RNA-seq dataset with [DISCERNS](https://github.com/khembach/DISCERNS).
-So far, we analysed three ALS datasets.
+So far, we analysed three ALS datasets. All analyses use [ARMOR](https://github.com/csoneson/ARMOR) for preprocessing and mapping.
 
 * ling_hela: The Hela samples from Ling et al. (2015)
 * petrucelli_patients: The frontal cortex samples of sALS patients and controls from Prudencioet al. (2015)
